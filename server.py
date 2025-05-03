@@ -1,109 +1,101 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse
-import fitz  # PyMuPDF for PDF reading
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import os
-import uuid
+import fitz  # PyMuPDF
 import openai
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+import uuid
+import os
 
-# Download NLTK data
-nltk.download('punkt')
-nltk.download('stopwords')
-
-# FastAPI app
 app = FastAPI()
 
-# OpenAI key (replace with your key or use environment variable)
+# Set your OpenAI API key (or use an env variable)
 openai.api_key = "your_openai_api_key"
 
-# === UTILS ===
+def extract_summary_and_skills(text: str) -> tuple[str, str]:
+    """Very basic extraction based on keywords. Improve with regex or NLP if needed."""
+    lower_text = text.lower()
+    summary = ""
+    skills = ""
+    
+    if "summary" in lower_text:
+        summary_start = lower_text.find("summary")
+        skills_start = lower_text.find("skills", summary_start + 1)
+        summary = text[summary_start:skills_start].strip() if skills_start != -1 else text[summary_start:].strip()
 
-def extract_text_from_pdf(pdf_path):
-    """Extracts all text from a PDF."""
-    doc = fitz.open(pdf_path)
-    text = " ".join([page.get_text("text") for page in doc])
-    return text.strip()
+    if "skills" in lower_text:
+        skills_start = lower_text.find("skills")
+        end = lower_text.find("\n\n", skills_start)
+        skills = text[skills_start:end].strip() if end != -1 else text[skills_start:].strip()
 
-def preprocess_text(text):
-    """Tokenize and clean text for comparison."""
-    tokens = word_tokenize(text.lower())
-    stop_words = set(stopwords.words('english'))
-    return {word for word in tokens if word.isalnum() and word not in stop_words}
+    return summary, skills
 
-def compare_resume_with_job(resume_text, job_text):
-    """Find keywords missing from resume."""
-    resume_words = preprocess_text(resume_text)
-    job_words = preprocess_text(job_text)
-    return list(job_words - resume_words)
-
-def optimize_resume(resume_text, missing_keywords):
-    """Use GPT to rewrite resume using missing keywords."""
+def ask_gpt_to_rewrite(summary: str, skills: str, job_description: str) -> tuple[str, str]:
     prompt = f"""
-    Here is a resume:
-    {resume_text}
+        You are a professional resume editor. Enhance the following resume sections to better align with the job description.
 
-    The job description suggests these keywords are missing: {', '.join(missing_keywords)}.
-    Please enhance the resume using these keywords in a natural way.
-    """
+        Job Description:
+        {job_description}
+
+        Original Summary:
+        {summary}
+
+        Original Skills:
+        {skills}
+
+        Please rewrite the Summary and Skills using relevant keywords from the job description, keeping the tone professional.
+        """
     response = openai.ChatCompletion.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{ "role": "user", "content": prompt }],
+        temperature=0.7
     )
-    return response["choices"][0]["message"]["content"]
+    output = response.choices[0].message.content
+    rewritten_summary = ""
+    rewritten_skills = ""
+    if "Summary:" in output and "Skills:" in output:
+        summary_idx = output.find("Summary:")
+        skills_idx = output.find("Skills:")
+        if summary_idx < skills_idx:
+            rewritten_summary = output[summary_idx + 8:skills_idx].strip()
+            rewritten_skills = output[skills_idx + 7:].strip()
+    return rewritten_summary, rewritten_skills
 
-def generate_pdf_from_text(text, filename):
-    """Generate a PDF file from plain text."""
-    file_path = f"{filename}.pdf"
-    c = canvas.Canvas(file_path, pagesize=letter)
-    width, height = letter
-    y = height - 40
+def overlay_text_on_pdf(original_path: str, summary: str, skills: str) -> str:
+    doc = fitz.open(original_path)
+    modified_path = f"optimized_{uuid.uuid4().hex}.pdf"
 
-    for line in text.splitlines():
-        if y < 40:
-            c.showPage()
-            y = height - 40
-        c.drawString(40, y, line)
-        y -= 15
+    for page in doc:
+        blocks = page.get_text("blocks")
+        for block in blocks:
+            x0, y0, x1, y1, text, _, _, _ = block
+            if "summary" in text.lower():
+                page.draw_rect((x0, y0, x1, y1), fill=(1, 1, 1))
+                page.insert_text((x0, y0), f"Summary\n{summary}", fontsize=11, wrap=300)
+            elif "skills" in text.lower():
+                page.draw_rect((x0, y0, x1, y1), fill=(1, 1, 1))
+                page.insert_text((x0, y0), f"Skills\n{skills}", fontsize=11, wrap=300)
 
-    c.save()
-    return file_path
-
-# === ROUTES ===
-
-@app.post("/process-resume/")
-async def process_resume(file: UploadFile = File(...), job_description: str = Form(...)):
-    """Check resume vs job description and return missing keywords."""
-    file_path = f"temp_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
-
-    resume_text = extract_text_from_pdf(file_path)
-    missing_keywords = compare_resume_with_job(resume_text, job_description)
-    os.remove(file_path)
-
-    return {"missing_keywords": missing_keywords}
+    doc.save(modified_path)
+    doc.close()
+    return modified_path
 
 @app.post("/optimize-resume/")
-async def optimize_resume_api(file: UploadFile = File(...), job_description: str = Form(...)):
-    """Optimize resume and return a downloadable PDF."""
-    file_path = f"temp_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+async def optimize_resume(file: UploadFile = File(...), job_description: str = Form(...)):
+    temp_filename = f"temp_{file.filename}"
+    with open(temp_filename, "wb") as f:
+        f.write(await file.read())
 
-    resume_text = extract_text_from_pdf(file_path)
-    missing_keywords = compare_resume_with_job(resume_text, job_description)
-    optimized_text = optimize_resume(resume_text, missing_keywords)
-    os.remove(file_path)
+    doc = fitz.open(temp_filename)
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text()
 
-    pdf_filename = f"optimized_resume_{uuid.uuid4().hex}"
-    pdf_path = generate_pdf_from_text(optimized_text, pdf_filename)
+    summary, skills = extract_summary_and_skills(full_text)
+    rewritten_summary, rewritten_skills = ask_gpt_to_rewrite(summary, skills, job_description)
+    updated_pdf_path = overlay_text_on_pdf(temp_filename, rewritten_summary, rewritten_skills)
+    os.remove(temp_filename)
 
     return FileResponse(
-        path=pdf_path,
+        path=updated_pdf_path,
         filename="optimized_resume.pdf",
         media_type="application/pdf"
     )
